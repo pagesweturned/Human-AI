@@ -1,0 +1,253 @@
+<!-- mturk-a3-2.html — Tweets → Cyberbullying Category (single-select with optional AI hint) -->
+<script src="https://assets.crowd.aws/crowd-html-elements.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+
+<crowd-form answer-format="flatten-objects">
+  <section style="max-width:900px;margin:16px auto;font:16px/1.5 system-ui;">
+    <h2 style="margin:0 0 8px;">Label the Category of Cyberbullying (Tweets)</h2>
+
+    <details open style="margin:8px 0 16px;">
+      <summary><b>Instructions</b></summary>
+      <ul style="margin:8px 0 0 18px;padding:0;">
+        <li>For each tweet, select the <b>single best</b> category.</li>
+        <li>If the <b>Show AI hint</b> button is present, you may reveal it. The AI can be wrong — use your judgment.</li>
+      </ul>
+      <p style="margin-top:8px;"><i>Answer options</i>:
+        <br>a. Age
+        <br>b. Ethnicity
+        <br>c. Gender
+        <br>d. Religion
+        <br>e. Other cyberbullying
+        <br>f. Not cyberbullying
+      </p>
+    </details>
+
+    <div id="status" style="color:#555;margin:8px 0;">Loading…</div>
+    <div id="quizArea"></div>
+
+    <!-- Hidden payload posted back to MTurk -->
+    <input type="hidden" name="answers_json"      id="answers_json">
+    <input type="hidden" name="trial_ids_json"    id="trial_ids_json">
+    <input type="hidden" name="durations_ms_json" id="durations_ms_json">
+    <input type="hidden" name="ai_shown_json"     id="ai_shown_json">
+    <input type="hidden" name="rt_total_ms"       id="rt_total_ms">
+    <input type="hidden" name="condition"         id="condition">
+  </section>
+
+  <script>
+    // ======== CONFIG ========
+    // Default CSV; override with ?csv=<RAW GitHub URL>
+    const DEFAULT_CSV = "https://raw.githubusercontent.com/pagesweturned/Human-AI/main/hai_dataset_quotes.csv";
+    const qs          = new URLSearchParams(location.search);
+    const CSV_URL     = qs.get("csv") || DEFAULT_CSV;
+
+    // Number of items; override with ?n=#
+    const N_FIXED     = Number(qs.get("n") || 6);
+
+    // condition=ai (hint allowed) | condition=control (no hint UI)
+    const condition   = (qs.get("condition") || "ai").toLowerCase();
+    document.getElementById("condition").value = condition;
+
+    // Labels (order must match radio mapping)
+    const CATEGORIES = [
+      "Age",
+      "Ethnicity",
+      "Gender",
+      "Religion",
+      "Other cyberbullying",
+      "Not cyberbullying"
+    ];
+
+    // ======== STATE ========
+    let TRIALS=[], CURRENT=[];
+    const answers   = {};   // trial_id -> chosen index (0..5)
+    const durations = {};   // trial_id -> ms (time to first selection)
+    const timers    = {};   // trial_id -> start time
+    const aiShown   = {};   // trial_id -> 0/1
+    const t0_total  = Date.now();
+
+    // ======== UTIL ========
+    function bucketConf(v){
+      if (v == null || isNaN(v)) return "Unknown";
+      if (v > 1 && v <= 100) v = v / 100; // normalize percent to 0..1
+      if (v < 0.33) return "Low";
+      if (v < 0.66) return "Medium";
+      return "High";
+    }
+    function uidFromIndex(i){ return "T" + (i + 1); }
+
+    // ======== DATA LOADING ========
+  // Replace your existing loadCsvTrials + init with this:
+
+  async function loadCsvTrials(){
+    // 1) Try fetching the CSV ourselves for better error messages
+    let res;
+    try {
+      res = await fetch(CSV_URL, { cache: "no-store", mode: "cors" });
+    } catch (e) {
+      throw new Error(`Network fetch failed: ${e && e.message ? e.message : e}`);
+    }
+
+    if (!res.ok) {
+      // e.g., 404, 403, 429, etc.
+      throw new Error(`HTTP ${res.status} ${res.statusText} while fetching ${CSV_URL}`);
+    }
+
+    let text;
+    try {
+      text = await res.text();
+    } catch (e) {
+      throw new Error(`Failed to read response body: ${e && e.message ? e.message : e}`);
+    }
+
+    // 2) Parse with Papa from a string (clearer parse errors)
+    const parsed = Papa.parse(text, {
+      header: true,
+      dynamicTyping: true,
+      skipEmptyLines: true
+    });
+
+    // If Papa had parse errors, surface the first few
+    if (parsed.errors && parsed.errors.length) {
+      const first = parsed.errors[0];
+      // Show where it failed (row, message, type)
+      throw new Error(`CSV parse error (row ${first.row ?? "?"}): ${first.message || first.type}`);
+    }
+
+    // Expect: tweet, model_output, model_confidence
+    const rows = Array.isArray(parsed.data) ? parsed.data : [];
+    TRIALS = rows.map((r, idx) => ({
+      trial_id:         "T" + (idx + 1),
+      tweet:            (r.tweet ?? "").toString(),
+      model_output:     r.model_output != null ? String(r.model_output) : "",
+      model_confidence: r.model_confidence != null ? Number(r.model_confidence) : NaN
+    })).filter(t => t.tweet.trim().length > 0);
+
+    if (!TRIALS.length) {
+      const keys = rows[0] ? Object.keys(rows[0]) : [];
+      throw new Error(`Parsed 0 usable rows. First-row keys: ${keys.join(", ") || "(none)"}`);
+    }
+  }
+
+
+    // Deterministic shuffle/sample by worker+assignment for consistent trials
+    function sampleTrials(all, n, key){
+      const seed = [...key].reduce((a,c)=>a+c.charCodeAt(0),0)+n;
+      const rnd=(i)=>{let x=Math.imul(1779033703,(seed+i)|0);x^=x>>>16;x=Math.imul(2246822507,x);x^=x>>>13;x=Math.imul(3266489909,x);x^=x>>>16;return (x>>>0)/4294967296;}
+      const arr=all.slice();
+      for(let i=arr.length-1;i>0;i--){const j=Math.floor(rnd(i)*(i+1));[arr[i],arr[j]]=[arr[j],arr[i]];}
+      return arr.slice(0, Math.min(n, arr.length));
+    }
+
+    // ======== UI RENDER ========
+    function renderQuiz(trials){
+      const area=document.getElementById("quizArea");
+      area.innerHTML="";
+      const showHintUI = (condition === "ai");
+
+      if (!trials.length){
+        document.getElementById("status").textContent = "Dataset is empty or missing required columns.";
+        return;
+      }
+
+      trials.forEach((t, idx)=>{
+        const card=document.createElement("div");
+        card.style.cssText="border:1px solid #ddd;border-radius:10px;padding:16px;margin:16px 0;background:#fff;";
+
+        // Build: header + empty blockquote for tweet text
+        const container = document.createElement("div");
+        container.innerHTML = `
+          <div style="font-weight:700;margin-bottom:6px;">Q${idx+1}</div>
+          <blockquote id="tw_${t.trial_id}"
+                      style="margin:8px 0;padding:10px;border-left:4px solid #888;background:#fafafa;"></blockquote>
+          ${ showHintUI ? `
+            <div style="margin:8px 0;">
+              <button type="button" class="hintBtn" data-id="${t.trial_id}"
+                      style="padding:6px 10px;border:1px solid #ccc;border-radius:8px;cursor:pointer;">
+                Show AI hint
+              </button>
+              <span id="hint_${t.trial_id}" style="margin-left:10px;color:#0a5a00;"></span>
+            </div>` : `` }
+        `;
+        card.appendChild(container);
+
+        // Safely set tweet via textContent (no HTML injection)
+        card.querySelector(`#tw_${t.trial_id}`).textContent = t.tweet;
+
+        // Build radios
+        const radiosWrap = document.createElement("div");
+        radiosWrap.style.marginTop = "6px";
+        radiosWrap.innerHTML = CATEGORIES.map((cat,i)=>`
+          <label style="display:block;border:1px solid #eee;border-radius:8px;padding:10px;margin:8px 0;">
+            <input type="radio" name="choice_${t.trial_id}" value="${i}" required> ${cat}
+          </label>
+        `).join("");
+        card.appendChild(radiosWrap);
+
+        // Attach to DOM
+        area.appendChild(card);
+
+        // timers & listeners
+        timers[t.trial_id]=Date.now();
+        aiShown[t.trial_id]=0;
+
+        card.addEventListener("change", ()=>{
+          const sel=card.querySelector(`input[name="choice_${t.trial_id}"]:checked`);
+          if (sel){
+            if (durations[t.trial_id] == null){
+              durations[t.trial_id] = Date.now()-timers[t.trial_id];
+            }
+            answers[t.trial_id] = Number(sel.value);
+          }
+        });
+
+        if (showHintUI){
+          const btn=card.querySelector(".hintBtn");
+          btn?.addEventListener("click", ()=>{
+            const confBucket = bucketConf(t.model_confidence);
+            const hintEl = document.getElementById(`hint_${t.trial_id}`);
+            if (t.model_output) {
+              hintEl.textContent = `AI suggests: “${t.model_output}” (${confBucket} confidence)`;
+            } else {
+              hintEl.textContent = "No AI available.";
+            }
+            aiShown[t.trial_id]=1;
+            btn.disabled=true;
+          });
+        }
+      });
+
+      const note=document.createElement("div");
+      note.style.cssText="margin:12px 0;color:#555;";
+      note.textContent="When finished, click the page’s Submit button at the bottom of the HIT.";
+      area.appendChild(note);
+
+      document.getElementById("status").textContent = `Loaded ${trials.length} tweets.`;
+    }
+
+    // ======== INIT ========
+    (async function init(){
+        const status = document.getElementById("status");
+        try {
+        await loadCsvTrials();
+        const workerId     = qs.get("workerId")     || "anon";
+        const assignmentId = qs.get("assignmentId") || "assign";
+        CURRENT = sampleTrials(TRIALS, N_FIXED, workerId + "|" + assignmentId);
+        renderQuiz(CURRENT);
+        status.textContent = `Loaded ${CURRENT.length} tweets.`;
+        } catch (e) {
+        console.error(e);
+        status.textContent = "Failed to load dataset: " + (e && e.message ? e.message : e);
+        }
+    })();
+
+    // ======== SUBMIT PACKAGING ========
+    document.querySelector("crowd-form").addEventListener("submit", ()=>{
+      document.getElementById("answers_json").value      = JSON.stringify(answers);
+      document.getElementById("trial_ids_json").value    = JSON.stringify(CURRENT.map(t=>t.trial_id));
+      document.getElementById("durations_ms_json").value = JSON.stringify(durations);
+      document.getElementById("ai_shown_json").value     = JSON.stringify(aiShown);
+      document.getElementById("rt_total_ms").value       = (Date.now()-t0_total);
+    });
+  </script>
+</crowd-form>
