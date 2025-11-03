@@ -22,8 +22,20 @@
       </p>
     </details>
 
+    <!-- MTURK STATUS / PREVIEW NOTICE -->
+    <div id="mturkNotice" style="display:none;padding:10px;border:1px solid #e6b800;background:#fff8e1;border-radius:8px;margin:8px 0;">
+      You’re previewing this HIT. Click <b>Accept</b> to start. (Inputs are disabled in preview.)
+    </div>
+
     <div id="status" style="color:#555;margin:8px 0;">Loading…</div>
     <div id="quizArea"></div>
+
+    <!-- Completion code shown once the task UI is ready -->
+    <div id="completionBox" style="display:none;border-top:1px solid #eee;margin-top:16px;padding-top:16px;">
+      <div style="font-weight:600;margin-bottom:6px;">Completion</div>
+      <div style="color:#333;margin-bottom:6px;">Copy this code back into MTurk if asked, and press <b>Submit</b>:</div>
+      <code id="completionCode" style="display:inline-block;padding:6px 10px;border:1px solid #ddd;border-radius:6px;background:#fafafa;"></code>
+    </div>
 
     <!-- Hidden payload posted back to MTurk -->
     <input type="hidden" name="answers_json"      id="answers_json">
@@ -32,23 +44,48 @@
     <input type="hidden" name="ai_shown_json"     id="ai_shown_json">
     <input type="hidden" name="rt_total_ms"       id="rt_total_ms">
     <input type="hidden" name="condition"         id="condition">
+    <!-- NEW: identifiers + completion code -->
+    <input type="hidden" name="worker_id"         id="worker_id">
+    <input type="hidden" name="assignment_id"     id="assignment_id">
+    <input type="hidden" name="hit_id"            id="hit_id">
+    <input type="hidden" name="survey_code"       id="survey_code">
   </section>
 
   <script>
     // ======== CONFIG ========
-    // Default CSV; override with ?csv=<RAW GitHub URL>
     const DEFAULT_CSV = "https://raw.githubusercontent.com/pagesweturned/Human-AI/main/hai_dataset_quotes.csv";
     const qs          = new URLSearchParams(location.search);
     const CSV_URL     = qs.get("csv") || DEFAULT_CSV;
 
-    // Number of items; override with ?n=#
     const N_FIXED     = Number(qs.get("n") || 6);
 
-    // condition=ai (hint allowed) | condition=control (no hint UI)
     const condition   = (qs.get("condition") || "ai").toLowerCase();
     document.getElementById("condition").value = condition;
 
-    // Labels (order must match radio mapping)
+    // ======== READ MTURK IDS ========
+    const workerId     = qs.get("workerId")     || "";
+    const assignmentId = qs.get("assignmentId") || "";
+    const hitId        = qs.get("hitId")        || "";
+
+    // Save to hidden fields
+    document.getElementById("worker_id").value     = workerId;
+    document.getElementById("assignment_id").value = assignmentId;
+    document.getElementById("hit_id").value        = hitId;
+
+    // Detect Preview mode and disable inputs until accepted
+    const inPreview = (assignmentId === "ASSIGNMENT_ID_NOT_AVAILABLE");
+    function setInputsDisabled(disabled) {
+      document.querySelectorAll("input, select, button").forEach(el => {
+        // keep the platform's bottom Submit button enabled; it isn't part of this DOM anyway
+        if (el.type !== "hidden") el.disabled = disabled;
+      });
+    }
+    if (inPreview) {
+      document.getElementById("mturkNotice").style.display = "block";
+      setInputsDisabled(true);
+    }
+
+    // ======== CATEGORIES ========
     const CATEGORIES = [
       "Age",
       "Ethnicity",
@@ -69,68 +106,55 @@
     // ======== UTIL ========
     function bucketConf(v){
       if (v == null || isNaN(v)) return "Unknown";
-      if (v > 1 && v <= 100) v = v / 100; // normalize percent to 0..1
+      if (v > 1 && v <= 100) v = v / 100; // percent → 0..1
       if (v < 0.33) return "Low";
       if (v < 0.66) return "Medium";
       return "High";
     }
     function uidFromIndex(i){ return "T" + (i + 1); }
 
-    // ======== DATA LOADING ========
-  // Replace your existing loadCsvTrials + init with this:
-
-  async function loadCsvTrials(){
-    // 1) Try fetching the CSV ourselves for better error messages
-    let res;
-    try {
-      res = await fetch(CSV_URL, { cache: "no-store", mode: "cors" });
-    } catch (e) {
-      throw new Error(`Network fetch failed: ${e && e.message ? e.message : e}`);
+    // Simple deterministic short code (based on worker+assignment+condition)
+    function shortCode(s){
+      let h=2166136261>>>0;
+      for(let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619)>>>0; }
+      return ("CYB-" + h.toString(36).toUpperCase()).slice(0,12);
     }
 
-    if (!res.ok) {
-      // e.g., 404, 403, 429, etc.
-      throw new Error(`HTTP ${res.status} ${res.statusText} while fetching ${CSV_URL}`);
+    // ======== DATA LOADING (fetch → Papa.parse for clearer errors) ========
+    async function loadCsvTrials(){
+      let res;
+      try {
+        res = await fetch(CSV_URL, { cache: "no-store", mode: "cors" });
+      } catch (e) {
+        throw new Error(`Network fetch failed: ${e && e.message ? e.message : e}`);
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} while fetching ${CSV_URL}`);
+
+      let text;
+      try { text = await res.text(); }
+      catch (e) { throw new Error(`Failed to read response body: ${e && e.message ? e.message : e}`); }
+
+      const parsed = Papa.parse(text, { header:true, dynamicTyping:true, skipEmptyLines:true });
+      if (parsed.errors && parsed.errors.length) {
+        const first = parsed.errors[0];
+        throw new Error(`CSV parse error (row ${first.row ?? "?"}): ${first.message || first.type}`);
+      }
+
+      const rows = Array.isArray(parsed.data) ? parsed.data : [];
+      TRIALS = rows.map((r, idx)=>({
+        trial_id:         uidFromIndex(idx),
+        tweet:            (r.tweet ?? "").toString(),
+        model_output:     r.model_output != null ? String(r.model_output) : "",
+        model_confidence: r.model_confidence != null ? Number(r.model_confidence) : NaN
+      })).filter(t => t.tweet.trim().length > 0);
+
+      if (!TRIALS.length) {
+        const keys = rows[0] ? Object.keys(rows[0]) : [];
+        throw new Error(`Parsed 0 usable rows. First-row keys: ${keys.join(", ") || "(none)"}`);
+      }
     }
 
-    let text;
-    try {
-      text = await res.text();
-    } catch (e) {
-      throw new Error(`Failed to read response body: ${e && e.message ? e.message : e}`);
-    }
-
-    // 2) Parse with Papa from a string (clearer parse errors)
-    const parsed = Papa.parse(text, {
-      header: true,
-      dynamicTyping: true,
-      skipEmptyLines: true
-    });
-
-    // If Papa had parse errors, surface the first few
-    if (parsed.errors && parsed.errors.length) {
-      const first = parsed.errors[0];
-      // Show where it failed (row, message, type)
-      throw new Error(`CSV parse error (row ${first.row ?? "?"}): ${first.message || first.type}`);
-    }
-
-    // Expect: tweet, model_output, model_confidence
-    const rows = Array.isArray(parsed.data) ? parsed.data : [];
-    TRIALS = rows.map((r, idx) => ({
-      trial_id:         "T" + (idx + 1),
-      tweet:            (r.tweet ?? "").toString(),
-      model_output:     r.model_output != null ? String(r.model_output) : "",
-      model_confidence: r.model_confidence != null ? Number(r.model_confidence) : NaN
-    })).filter(t => t.tweet.trim().length > 0);
-
-    if (!TRIALS.length) {
-      const keys = rows[0] ? Object.keys(rows[0]) : [];
-      throw new Error(`Parsed 0 usable rows. First-row keys: ${keys.join(", ") || "(none)"}`);
-    }
-  }
-
-
-    // Deterministic shuffle/sample by worker+assignment for consistent trials
+    // ======== SAMPLE ========
     function sampleTrials(all, n, key){
       const seed = [...key].reduce((a,c)=>a+c.charCodeAt(0),0)+n;
       const rnd=(i)=>{let x=Math.imul(1779033703,(seed+i)|0);x^=x>>>16;x=Math.imul(2246822507,x);x^=x>>>13;x=Math.imul(3266489909,x);x^=x>>>16;return (x>>>0)/4294967296;}
@@ -154,12 +178,10 @@
         const card=document.createElement("div");
         card.style.cssText="border:1px solid #ddd;border-radius:10px;padding:16px;margin:16px 0;background:#fff;";
 
-        // Build: header + empty blockquote for tweet text
         const container = document.createElement("div");
         container.innerHTML = `
           <div style="font-weight:700;margin-bottom:6px;">Q${idx+1}</div>
-          <blockquote id="tw_${t.trial_id}"
-                      style="margin:8px 0;padding:10px;border-left:4px solid #888;background:#fafafa;"></blockquote>
+          <blockquote id="tw_${t.trial_id}" style="margin:8px 0;padding:10px;border-left:4px solid #888;background:#fafafa;"></blockquote>
           ${ showHintUI ? `
             <div style="margin:8px 0;">
               <button type="button" class="hintBtn" data-id="${t.trial_id}"
@@ -171,10 +193,8 @@
         `;
         card.appendChild(container);
 
-        // Safely set tweet via textContent (no HTML injection)
         card.querySelector(`#tw_${t.trial_id}`).textContent = t.tweet;
 
-        // Build radios
         const radiosWrap = document.createElement("div");
         radiosWrap.style.marginTop = "6px";
         radiosWrap.innerHTML = CATEGORIES.map((cat,i)=>`
@@ -184,10 +204,8 @@
         `).join("");
         card.appendChild(radiosWrap);
 
-        // Attach to DOM
         area.appendChild(card);
 
-        // timers & listeners
         timers[t.trial_id]=Date.now();
         aiShown[t.trial_id]=0;
 
@@ -206,39 +224,40 @@
           btn?.addEventListener("click", ()=>{
             const confBucket = bucketConf(t.model_confidence);
             const hintEl = document.getElementById(`hint_${t.trial_id}`);
-            if (t.model_output) {
-              hintEl.textContent = `AI suggests: “${t.model_output}” (${confBucket} confidence)`;
-            } else {
-              hintEl.textContent = "No AI available.";
-            }
+            hintEl.textContent = t.model_output
+              ? `AI suggests: “${t.model_output}” (${confBucket} confidence)`
+              : "No AI available.";
             aiShown[t.trial_id]=1;
             btn.disabled=true;
           });
         }
       });
 
-      const note=document.createElement("div");
-      note.style.cssText="margin:12px 0;color:#555;";
-      note.textContent="When finished, click the page’s Submit button at the bottom of the HIT.";
-      area.appendChild(note);
-
       document.getElementById("status").textContent = `Loaded ${trials.length} tweets.`;
+
+      // Generate and show a completion code as soon as UI is ready (hidden in Preview via disabled inputs)
+      const code = shortCode([workerId, assignmentId, condition].join("|"));
+      document.getElementById("survey_code").value = code;
+      const codeEl = document.getElementById("completionCode");
+      codeEl.textContent = code;
+      document.getElementById("completionBox").style.display = "block";
+
+      // Re-enable inputs if the worker accepted the HIT
+      if (!inPreview) setInputsDisabled(false);
     }
 
     // ======== INIT ========
     (async function init(){
-        const status = document.getElementById("status");
-        try {
+      const status = document.getElementById("status");
+      try {
         await loadCsvTrials();
-        const workerId     = qs.get("workerId")     || "anon";
-        const assignmentId = qs.get("assignmentId") || "assign";
-        CURRENT = sampleTrials(TRIALS, N_FIXED, workerId + "|" + assignmentId);
+        const stableKey = (workerId || "anon") + "|" + (assignmentId || "assign");
+        CURRENT = sampleTrials(TRIALS, N_FIXED, stableKey);
         renderQuiz(CURRENT);
-        status.textContent = `Loaded ${CURRENT.length} tweets.`;
-        } catch (e) {
+      } catch (e) {
         console.error(e);
         status.textContent = "Failed to load dataset: " + (e && e.message ? e.message : e);
-        }
+      }
     })();
 
     // ======== SUBMIT PACKAGING ========
@@ -248,6 +267,7 @@
       document.getElementById("durations_ms_json").value = JSON.stringify(durations);
       document.getElementById("ai_shown_json").value     = JSON.stringify(aiShown);
       document.getElementById("rt_total_ms").value       = (Date.now()-t0_total);
+      // ids + code already set
     });
   </script>
 </crowd-form>
