@@ -57,7 +57,7 @@
     const qs          = new URLSearchParams(location.search);
     const CSV_URL     = qs.get("csv") || DEFAULT_CSV;
 
-    const GOOGLE_SHEET_URL = "PASTE_YOUR_DEPLOYED_WEB_APP_URL_HERE";
+    const GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycby7U8TwSmjoqW6FT7KrLgDNROtJFObosiFx3HQPa2yFvHCE_mDkeDgeRQCEYgBU8Rmb/exec";
 
     const N_FIXED     = Number(qs.get("n") || 6);
 
@@ -263,13 +263,45 @@
     })();
 
     // ======== SUBMIT PACKAGING ========
-    document.querySelector("crowd-form").addEventListener("submit", ()=>{
-      document.getElementById("answers_json").value      = JSON.stringify(answers);
-      document.getElementById("trial_ids_json").value    = JSON.stringify(CURRENT.map(t=>t.trial_id));
-      document.getElementById("durations_ms_json").value = JSON.stringify(durations);
-      document.getElementById("ai_shown_json").value     = JSON.stringify(aiShown);
-      document.getElementById("rt_total_ms").value       = (Date.now()-t0_total);
-      // ids + code already set
-    });
+document.querySelector("crowd-form").addEventListener("submit", ()=>{
+  // This is the original code to package data for MTurk
+  document.getElementById("answers_json").value      = JSON.stringify(answers);
+  document.getElementById("trial_ids_json").value    = JSON.stringify(CURRENT.map(t=>t.trial_id));
+  document.getElementById("durations_ms_json").value = JSON.stringify(durations);
+  document.getElementById("ai_shown_json").value     = JSON.stringify(aiShown);
+  document.getElementById("rt_total_ms").value       = (Date.now()-t0_total);
+
+  // 1. Check if the URL was set
+  if (GOOGLE_SHEET_URL && GOOGLE_SHEET_URL.includes("https.script.google.com")) {
+    try {
+      // 2. Create a payload object with all the data
+      const payload = {
+        worker_id:         document.getElementById("worker_id").value,
+        assignment_id:     document.getElementById("assignment_id").value,
+        hit_id:            document.getElementById("hit_id").value,
+        condition:         document.getElementById("condition").value,
+        survey_code:       document.getElementById("survey_code").value,
+        answers_json:      document.getElementById("answers_json").value,
+        trial_ids_json:    document.getElementById("trial_ids_json").value,
+        durations_ms_json: document.getElementById("durations_ms_json").value,
+        ai_shown_json:     document.getElementById("ai_shown_json").value,
+        rt_total_ms:       document.getElementById("rt_total_ms").value
+      };
+
+      // 3. Create a "Blob" (Binary Large Object) to send
+      // This is the required format for sendBeacon to send JSON
+      const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+
+      // 4. Send the data!
+      // navigator.sendBeacon is designed to fire-and-forget data
+      // right as a page unloads, without slowing down the user's submit.
+      navigator.sendBeacon(GOOGLE_SHEET_URL, blob);
+
+    } catch (err) {
+      // Log any errors to the console, but don't stop the MTurk submit
+      console.error("Error sending data to Google Sheet:", err);
+    }
+  }
+});
   </script>
 </crowd-form>
