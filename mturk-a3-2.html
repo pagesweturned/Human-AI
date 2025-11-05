@@ -57,6 +57,8 @@
     const qs          = new URLSearchParams(location.search);
     const CSV_URL     = qs.get("csv") || DEFAULT_CSV;
 
+    const GOOGLE_SHEET_URL = "PASTE_YOUR_DEPLOYED_WEB_APP_URL_HERE";
+
     const N_FIXED     = Number(qs.get("n") || 6);
 
     const condition   = (qs.get("condition") || "ai").toLowerCase();
